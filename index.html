@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0"/>
+  <title>N4 Kanji Study</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{background:#0f0f17;color:#fff;font-family:'Noto Sans JP','Hiragino Sans','Yu Gothic',sans-serif;min-height:100vh}
+    #app{max-width:480px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column}
+    button,input{font-family:inherit}
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-track{background:#0f0f17}
+    ::-webkit-scrollbar-thumb{background:#333;border-radius:2px}
+    .page{min-height:100vh;display:flex;flex-direction:column}
+    .header{display:flex;align-items:center;padding:14px 20px;border-bottom:1px solid rgba(255,255,255,0.07)}
+    .back-btn{background:none;border:none;color:#888;font-size:18px;cursor:pointer;margin-right:12px;padding:4px 8px}
+    .primary-btn{flex:1;padding:14px 0;background:linear-gradient(135deg,#6741d9,#9775fa);border:none;border-radius:12px;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+    .card{background:#14141f;border-radius:16px;padding:16px}
+    .row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+    .label{color:#666;font-size:13px;flex-shrink:0}
+    .val{color:#ddd;font-size:14px;max-width:65%;text-align:right}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// Clear any stale data from older versions of this app
+(function(){
+  const keysToRemove = [];
+  for(let i=0; i<localStorage.length; i++){
+    const k = localStorage.key(i);
+    if(k && (k.startsWith("n4kanji") || k.startsWith("n4srs") || k.startsWith("n4ov"))){
+      keysToRemove.push(k);
+    }
+  }
+  keysToRemove.forEach(k => localStorage.removeItem(k));
+})();
+
+const SHEET_ID = "1YIOYntPLK4klwkaiXW9LfVZTXIJNYDS-POOXARI7xqk";
+const SHEET_URL = "https://docs.google.com/spreadsheets/d/"+SHEET_ID+"/export?format=csv&gid=0";
+const STAGES=["Apprentice 1","Apprentice 2","Apprentice 3","Apprentice 4","Guru 1","Guru 2","Master","Enlightened","Burned"];
+const COLORS=["#f03e3e","#f03e3e","#f03e3e","#f03e3e","#6741d9","#6741d9","#1864ab","#0ca678","#495057"];
+const ICONS=["🌱","🌱","🌱","🌱","🔮","🔮","⚡","✨","🔥"];
+const DELAYS=[4,8,24,48,168,336,720,2880,99999999].map(h=>h*3600000);
+const LS_SRS="n4srs_v3", LS_OV="n4ov_v3";
+
+// ── State ─────────────────────────────────────────────────────────────────
+let S = {
+  screen:"loading", kanji:[], srs:{}, overrides:{},
+  reviewQueue:[], lessonQueue:[], currentCard:null, quizType:"meaning",
+  input:"", feedback:null, showInfo:false,
+  lessonStep:"learn", lessonIndex:0, streak:0,
+  timeOffset:0, showDev:false, loadError:null,
+  editingKanji:null, adminSearch:"", savedKanji:null
+};
+const now = ()=> Date.now() + S.timeOffset;
+const render = ()=> { document.getElementById("app").innerHTML=""; document.getElementById("app").appendChild(buildApp()); };
+
+// ── CSV Parser ────────────────────────────────────────────────────────────
+function parseCSV(text){
+  const rows=[];let row=[],field="",inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(c==='"'){if(inQ&&text[i+1]==='"'){field+='"';i++;}else inQ=!inQ;}
+    else if(c===','&&!inQ){row.push(field);field="";}
+    else if((c==='\n'||c==='\r')&&!inQ){if(c==='\r'&&text[i+1]==='\n')i++;row.push(field);field="";rows.push(row);row=[];}
+    else field+=c;
+  }
+  if(field||row.length){row.push(field);rows.push(row);}
+  return rows;
+}
+function isCJK(s){return /^[\u3000-\u9FFF\uF900-\uFAFF\u3400-\u4DBF]{1,4}$/.test((s||"").trim());}
+function cleanReading(s){
+  const n=(s||"").replace(/\s*[•·]\s*/g,"、").trim();
+  return /^[a-zA-Z\s]+$/.test(n)?"":n;
+}
+function rowToKanji(row){
+  const g=i=>(row[i]||"").trim();
+  const colA=g(0),colB=g(1);
+  const kanji=isCJK(colA)?colA:isCJK(colB)?colB:colA;
+  const meaning=isCJK(colA)?colB:isCJK(colB)?colA:colB;
+  if(!kanji||kanji==="Kanji char")return null;
+  const kunyomi=cleanReading(g(2)), onyomi=cleanReading(g(3));
+  const comps=[];
+  if(g(6))comps.push({name:g(6),symbol:g(7)});
+  if(g(9))comps.push({name:g(9),symbol:g(10)});
+  if(g(12))comps.push({name:g(12),symbol:g(13)});
+  if(g(15))comps.push({name:g(15),symbol:g(16)});
+  const ex1=g(18)?{word:g(18),romaji:g(19),meaning:g(20)}:null;
+  const ex2=g(21)?{word:g(21),romaji:g(22),meaning:g(23)}:null;
+  return{kanji,meaning,kunyomi,onyomi,mnemonic:g(17),components:comps,ex1,ex2,level:g(24),
+    quizMeaning:true,quizOn:!!onyomi,quizKun:!!kunyomi};
+}
+
+// ── Romaji helpers ────────────────────────────────────────────────────────
+const R2H=[["shi","し"],["chi","ち"],["tsu","つ"],["sha","しゃ"],["shu","しゅ"],["sho","しょ"],
+  ["cha","ちゃ"],["chu","ちゅ"],["cho","ちょ"],["nya","にゃ"],["nyu","にゅ"],["nyo","にょ"],
+  ["hya","ひゃ"],["hyu","ひゅ"],["hyo","ひょ"],["mya","みゃ"],["myu","みゅ"],["myo","みょ"],
+  ["rya","りゃ"],["ryu","りゅ"],["ryo","りょ"],["gya","ぎゃ"],["gyu","ぎゅ"],["gyo","ぎょ"],
+  ["bya","びゃ"],["byu","びゅ"],["byo","びょ"],["pya","ぴゃ"],["pyu","ぴゅ"],["pyo","ぴょ"],
+  ["kya","きゃ"],["kyu","きゅ"],["kyo","きょ"],["ja","じゃ"],["ji","じ"],["ju","じゅ"],["jo","じょ"],
+  ["za","ざ"],["zi","じ"],["zu","ず"],["ze","ぜ"],["zo","ぞ"],
+  ["da","だ"],["di","ぢ"],["du","づ"],["de","で"],["do","ど"],
+  ["ba","ば"],["bi","び"],["bu","ぶ"],["be","べ"],["bo","ぼ"],
+  ["pa","ぱ"],["pi","ぴ"],["pu","ぷ"],["pe","ぺ"],["po","ぽ"],
+  ["ka","か"],["ki","き"],["ku","く"],["ke","け"],["ko","こ"],
+  ["sa","さ"],["su","す"],["se","せ"],["so","そ"],["ta","た"],["te","て"],["to","と"],
+  ["na","な"],["ni","に"],["nu","ぬ"],["ne","ね"],["no","の"],
+  ["ha","は"],["hi","ひ"],["fu","ふ"],["he","へ"],["ho","ほ"],
+  ["ma","ま"],["mi","み"],["mu","む"],["me","め"],["mo","も"],
+  ["ya","や"],["yu","ゆ"],["yo","よ"],["ra","ら"],["ri","り"],["ru","る"],["re","れ"],["ro","ろ"],
+  ["wa","わ"],["wo","を"],["ga","が"],["gi","ぎ"],["gu","ぐ"],["ge","げ"],["go","ご"],
+  ["a","あ"],["i","い"],["u","う"],["e","え"],["o","お"],["n","ん"]];
+const toHira=s=>s.split("").map(c=>{const n=c.charCodeAt(0);return(n>=0x30A1&&n<=0x30F6)?String.fromCharCode(n-0x60):c;}).join("");
+const r2h=str=>{let res="",s=str.toLowerCase().replace(/([bcdfghjklmnpqrstvwxyz])\1/g,"っ$1");
+  while(s.length){let m=false;for(const[r,h]of R2H){if(s.startsWith(r)){res+=h;s=s.slice(r.length);m=true;break;}}if(!m){res+=s[0];s=s.slice(1);}}return res;};
+const normR=s=>toHira(r2h(s.trim().toLowerCase()));
+const acceptable=str=>str.split(/[、,]/).map(r=>r.trim()).filter(Boolean).flatMap(r=>{
+  if(r.includes(".")){const[a,b]=r.split(".");return[a+b,a];}return[r];});
+
+// ── SRS helpers ───────────────────────────────────────────────────────────
+function eligibleTypes(k){
+  const t=[];
+  if(k.quizMeaning)t.push("meaning");
+  if(k.quizOn&&k.onyomi)t.push("onyomi");
+  if(k.quizKun&&k.kunyomi)t.push("kunyomi");
+  return t.length?t:["meaning"];
+}
+function getAnswer(k,t){
+  if(t==="meaning")return(k.meaning||"").split(",")[0].trim().toLowerCase();
+  if(t==="onyomi")return(k.onyomi||"").split("、")[0].trim();
+  return((k.kunyomi||k.onyomi)||"").split("、")[0].trim();
+}
+function checkAnswer(k,t,ua){
+  if(t==="meaning"){
+    const lc=ua.toLowerCase();
+    return(k.meaning||"").split(",").map(m=>m.trim().toLowerCase()).some(m=>m===lc)||
+      ((k.meaning||"").toLowerCase().includes(lc)&&lc.length>2);
+  }
+  const src=t==="onyomi"?k.onyomi:(k.kunyomi||k.onyomi)||"";
+  const nu=normR(ua);
+  return acceptable(src).some(r=>normR(r)===nu);
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────
+function el(tag,attrs,...children){
+  const e=document.createElement(tag);
+  for(const[k,v]of Object.entries(attrs||{})){
+    if(k==="style"&&typeof v==="object"){Object.assign(e.style,v);}
+    else if(k.startsWith("on")&&typeof v==="function"){e.addEventListener(k.slice(2).toLowerCase(),v);}
+    else if(k==="className"){e.className=v;}
+    else e.setAttribute(k,v);
+  }
+  for(const c of children){
+    if(c==null||c===false)continue;
+    e.appendChild(typeof c==="string"||typeof c==="number"?document.createTextNode(c):c);
+  }
+  return e;
+}
+const div=(a,...c)=>el("div",a,...c);
+const span=(a,...c)=>el("span",a,...c);
+const btn=(a,...c)=>el("button",a,...c);
+const inp=(a)=>el("input",a);
+
+// ── Load data ─────────────────────────────────────────────────────────────
+async function loadSheet(){
+  S.screen="loading"; render();
+  try{
+    const res=await fetch(SHEET_URL);
+    if(!res.ok)throw new Error("HTTP "+res.status);
+    const text=await res.text();
+    const rows=parseCSV(text);
+    const parsed=rows.map(rowToKanji).filter(Boolean);
+    if(!parsed.length)throw new Error("No kanji found — check sheet headers");
+    try{S.overrides=JSON.parse(localStorage.getItem(LS_OV)||"{}");}catch(e){}
+    S.kanji=parsed.map(k=>S.overrides[k.kanji]?{...k,...S.overrides[k.kanji]}:k);
+    let saved={};try{saved=JSON.parse(localStorage.getItem(LS_SRS)||"{}");}catch(e){}
+    S.kanji.forEach(k=>{S.srs[k.kanji]=saved[k.kanji]||{stage:0,nextReview:Date.now(),correct:0,incorrect:0,learned:false};});
+    S.screen="home"; render();
+  }catch(err){
+    S.loadError=err.message; S.screen="error"; render();
+  }
+}
+function saveSRS(){try{localStorage.setItem(LS_SRS,JSON.stringify(S.srs));}catch(e){}}
+function saveOverrides(){try{localStorage.setItem(LS_OV,JSON.stringify(S.overrides));}catch(e){}}
+
+// ── Navigate ──────────────────────────────────────────────────────────────
+function go(screen){
+  S.screen=screen; S.feedback=null; S.input=""; S.showInfo=false;
+  if(screen==="review"){
+    const reviewable=S.kanji.filter(k=>{const s=S.srs[k.kanji];return s&&s.learned&&s.nextReview<=now();});
+    S.reviewQueue=reviewable.flatMap(k=>eligibleTypes(k).map(t=>({...k,quizType:t}))).sort(()=>Math.random()-.5);
+    S.currentCard=S.reviewQueue[0]||null;
+    S.quizType=S.currentCard?.quizType||"meaning";
+  }
+  if(screen==="lessons"){
+    const unlearned=S.kanji.filter(k=>!S.srs[k.kanji]?.learned);
+    S.lessonQueue=unlearned.slice(0,5);
+    S.lessonIndex=0; S.lessonStep="learn";
+  }
+  render();
+}
+
+// ── Submit answer ─────────────────────────────────────────────────────────
+function submitAnswer(){
+  if(!S.currentCard||S.feedback)return;
+  const ok=checkAnswer(S.currentCard,S.quizType,S.input);
+  S.feedback=ok?"correct":"incorrect";
+  const item=S.srs[S.currentCard.kanji];
+  const ns=ok?Math.min(item.stage+1,8):Math.max(item.stage-1,0);
+  S.srs[S.currentCard.kanji]={...item,stage:ns,nextReview:now()+DELAYS[ns],
+    correct:item.correct+(ok?1:0),incorrect:item.incorrect+(!ok?1:0)};
+  if(ok)S.streak++;else S.streak=0;
+  saveSRS(); render();
+}
+function nextCard(){
+  const rem=S.reviewQueue.slice(1);
+  if(S.feedback==="incorrect")rem.push({...S.currentCard,quizType:eligibleTypes(S.currentCard)[0]});
+  S.reviewQueue=rem; S.feedback=null; S.input=""; S.showInfo=false;
+  if(rem.length){S.currentCard=rem[0];S.quizType=rem[0].quizType;}
+  else{S.screen="home";S.reviewQueue=[];}
+  render();
+}
+function markLearned(kanji){
+  S.srs[kanji]={...S.srs[kanji],learned:true,nextReview:now()+DELAYS[0]};
+  saveSRS();
+}
+
+// ── Build screens ─────────────────────────────────────────────────────────
+function buildApp(){
+  if(S.screen==="loading")return buildLoading();
+  if(S.screen==="error")return buildError();
+  if(S.screen==="home")return buildHome();
+  if(S.screen==="lessons")return buildLessons();
+  if(S.screen==="review")return buildReview();
+  if(S.screen==="stats")return buildStats();
+  if(S.screen==="admin")return buildAdmin();
+  if(S.screen==="editKanji")return buildEditor();
+  return buildHome();
+}
+
+function buildLoading(){
+  return div({style:{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"16px"}},
+    div({style:{fontSize:"56px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",color:"#f03e3e",animation:"pulse 1.5s ease-in-out infinite"}},"漢"),
+    div({style:{color:"#666",fontSize:"14px"}},"Loading kanji from Google Sheets...")
+  );
+}
+
+function buildError(){
+  return div({style:{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"16px",padding:"24px",textAlign:"center"}},
+    div({style:{fontSize:"40px"}},"⚠️"),
+    div({style:{color:"#f03e3e",fontSize:"18px",fontWeight:"600"}},"Couldn't load Google Sheet"),
+    div({style:{color:"#888",fontSize:"13px",maxWidth:"340px",lineHeight:"1.6"}},"Error: "+S.loadError),
+    div({style:{color:"#555",fontSize:"12px",maxWidth:"340px",lineHeight:"1.8"}},'Make sure the sheet is set to "Anyone with the link can view"'),
+    btn({style:{padding:"12px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",cursor:"pointer",marginTop:"8px"},onClick:()=>loadSheet()},"Try Again")
+  );
+}
+
+function buildHome(){
+  const reviewable=S.kanji.filter(k=>{const s=S.srs[k.kanji];return s&&s.learned&&s.nextReview<=now();});
+  const unlearned=S.kanji.filter(k=>!S.srs[k.kanji]?.learned);
+  const totalLearned=Object.values(S.srs).filter(s=>s.learned).length;
+
+  const topBar=div({style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px",borderBottom:"1px solid #1e1e2e"}},
+    div({style:{display:"flex",alignItems:"center",gap:"10px"}},
+      span({style:{fontSize:"28px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",color:"#f03e3e",fontWeight:"700"}},"漢字"),
+      span({style:{fontSize:"15px",color:"#888",letterSpacing:"1px"}},"N4 Study")
+    ),
+    div({style:{display:"flex",gap:"8px",alignItems:"center"}},
+      btn({style:{background:"none",border:"none",fontSize:"22px",cursor:"pointer"},onClick:()=>go("admin"),title:"Admin"},"⚙️"),
+      btn({style:{background:"none",border:"none",fontSize:"22px",cursor:"pointer"},onClick:()=>go("stats")},"📊"),
+      btn({style:{background:"none",border:"none",fontSize:"14px",cursor:"pointer",opacity:".45"},onClick:()=>{S.showDev=!S.showDev;render();},title:"QA"},"🛠")
+    )
+  );
+
+  const devPanel=S.showDev?div({style:{margin:"0 20px 4px",background:"#0a0a14",border:"1px solid #ffd43b44",borderRadius:"14px",padding:"14px 16px"}},
+    div({style:{fontSize:"12px",color:"#ffd43b",fontWeight:"700",letterSpacing:"1px",marginBottom:"8px",textTransform:"uppercase"}},"🛠 Dev Controls"),
+    div({style:{fontSize:"13px",color:"#888",marginBottom:"10px"}},"⏱ Offset: +"+Math.round(S.timeOffset/3600000)+"h · "+reviewable.length+" reviews due · "+S.kanji.length+" kanji loaded"),
+    div({style:{display:"flex",gap:"8px",flexWrap:"wrap"}},
+      ...[["4h",4],["12h",12],["24h",24],["7d",168]].map(([l,h])=>
+        btn({style:{padding:"7px 14px",background:"#1a1a2e",border:"1px solid #333",borderRadius:"8px",color:"#ccc",fontSize:"13px",cursor:"pointer"},onClick:()=>{S.timeOffset+=h*3600000;render();}},"+"+l)
+      ),
+      btn({style:{padding:"7px 14px",background:"#2b0000",border:"1px solid #f03e3e",borderRadius:"8px",color:"#f03e3e",fontSize:"13px",cursor:"pointer"},onClick:()=>{
+        const f={};S.kanji.forEach(k=>{f[k.kanji]={stage:0,nextReview:Date.now(),correct:0,incorrect:0,learned:false};});
+        S.srs=f;S.timeOffset=0;saveSRS();render();
+      }},"Reset All")
+    )
+  ):null;
+
+  const heroKanji=div({style:{display:"flex",gap:"16px",fontSize:"32px",marginBottom:"20px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif"}},
+    ...S.kanji.slice(0,6).map(k=>{
+      const s=S.srs[k.kanji];
+      return span({style:{opacity:s?.learned?"1":"0.2",color:s?.learned?COLORS[s.stage]:"#fff",transition:"color .5s"}},k.kanji);
+    })
+  );
+
+  const stats=div({style:{display:"flex",alignItems:"center"}},
+    ...[[""+totalLearned+"/"+S.kanji.length,"Learned"],
+        [reviewable.length,"Reviews"],
+        [unlearned.length,"Lessons"]].flatMap(([n,l],i)=>[
+      i>0?div({style:{width:"1px",height:"40px",background:"#222"}}):null,
+      div({style:{flex:"1",textAlign:"center"}},
+        div({style:{fontSize:"32px",fontWeight:"700",color:(l==="Reviews"&&reviewable.length>0)?"#f03e3e":"#fff"}},""+n),
+        div({style:{fontSize:"12px",color:"#666",marginTop:"2px"}},l)
+      )
+    ].filter(Boolean))
+  );
+
+  const mkActionCard=(icon,label,count,color,enabled,onclick)=>
+    btn({style:{flex:"1",background:"#14141f",border:"2px solid "+(enabled?color:"#333"),borderRadius:"16px",padding:"20px 16px",cursor:enabled?"pointer":"default",textAlign:"center",color:"#fff",opacity:enabled?"1":".5"},onClick:enabled?onclick:null},
+      div({style:{fontSize:"28px",marginBottom:"6px"}},icon),
+      div({style:{fontSize:"14px",color:"#aaa",marginBottom:"4px"}},label),
+      div({style:{fontSize:"20px",fontWeight:"700",color:color}},""+count)
+    );
+
+  const actions=div({style:{display:"flex",gap:"12px",padding:"20px"}},
+    mkActionCard("📝","Reviews",reviewable.length,"#f03e3e",reviewable.length>0,()=>go("review")),
+    mkActionCard("📚","Lessons",Math.min(unlearned.length,5)+" new","#6741d9",unlearned.length>0,()=>go("lessons"))
+  );
+
+  const learnedKanji=S.kanji.filter(k=>S.srs[k.kanji]?.learned).slice(0,8);
+  const quickList=div({style:{padding:"0 20px",display:"flex",flexDirection:"column",gap:"8px",overflowY:"auto",flex:"1",paddingBottom:"24px"}},
+    ...(learnedKanji.length?learnedKanji.map(k=>{
+      const s=S.srs[k.kanji];
+      return div({style:{display:"flex",alignItems:"center",gap:"14px",padding:"10px 14px",background:"#14141f",borderRadius:"12px"}},
+        div({style:{fontSize:"28px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",width:"40px",textAlign:"center",color:COLORS[s.stage]}},k.kanji),
+        div({style:{flex:"1"}},
+          div({style:{fontSize:"14px",color:"#ddd"}},(k.meaning||"").split(",")[0]),
+          div({style:{fontSize:"12px",marginTop:"2px",color:COLORS[s.stage]}},ICONS[s.stage]+" "+STAGES[s.stage])
+        )
+      );
+    }):[div({style:{color:"#555",fontSize:"14px",padding:"12px 0"}},"Start lessons to add kanji here")])
+  );
+
+  const wrap=div({style:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"}},
+    topBar,
+    devPanel,
+    div({style:{padding:"24px 20px 12px",borderBottom:"1px solid #1e1e2e"}},heroKanji,stats),
+    actions,
+    div({style:{padding:"4px 20px 12px",fontSize:"12px",color:"#555",textTransform:"uppercase",letterSpacing:"1px"}},"Quick Review"),
+    quickList
+  );
+  if(!devPanel){wrap.children[1]&&wrap.removeChild(wrap.children[1]);}
+  return wrap;
+}
+
+function buildLessons(){
+  if(!S.lessonQueue.length){
+    return div({style:{minHeight:"100vh",background:"#0f0f17",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"12px"}},
+      div({style:{color:"#aaa"}}, "No new lessons."),
+      btn({style:{padding:"12px 24px",background:"#1e1e2e",border:"1px solid #333",borderRadius:"12px",color:"#aaa",fontSize:"15px",cursor:"pointer"},onClick:()=>go("home")},"← Back")
+    );
+  }
+  if(S.lessonStep==="done"){
+    return div({style:{minHeight:"100vh",background:"#0f0f17",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"12px"}},
+      div({style:{fontSize:"48px",marginBottom:"12px"}},"🎉"),
+      div({style:{fontSize:"22px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",marginBottom:"8px"}},"Lesson Complete!"),
+      div({style:{color:"#888",marginBottom:"24px"}},S.lessonQueue.length+" kanji added to reviews"),
+      btn({style:{padding:"14px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"16px",fontWeight:"600",cursor:"pointer"},onClick:()=>{S.lessonQueue=[];go("home");}},"Back to Dashboard")
+    );
+  }
+
+  const item=S.lessonQueue[S.lessonIndex];
+  const header=div({className:"header"},
+    btn({className:"back-btn",onClick:()=>go("home")},"✕"),
+    span({style:{fontWeight:"600",fontSize:"16px",flex:"1"}},"Lessons"),
+    span({style:{color:"#666",fontSize:"14px"}},(S.lessonIndex+1)+" / "+S.lessonQueue.length)
+  );
+
+  const kanjiTile=div({style:{width:"140px",height:"140px",borderRadius:"24px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"72px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",color:"#fff",background:"linear-gradient(135deg,#e03131,#c92a2a)",boxShadow:"0 8px 32px rgba(0,0,0,0.4)",flexShrink:"0"}},item.kanji);
+
+  const sections=[];
+
+  // Components
+  if(item.components&&item.components.length){
+    sections.push(div({style:{width:"100%",background:"#14141f",borderRadius:"16px",padding:"14px"}},
+      div({style:{fontSize:"11px",color:"#555",textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}},"Components"),
+      div({style:{display:"flex",gap:"8px",flexWrap:"wrap"}},
+        ...item.components.map(c=>div({style:{display:"flex",alignItems:"center",gap:"6px",background:"#1e1e2e",borderRadius:"10px",padding:"6px 12px"}},
+          c.symbol?span({style:{fontSize:"20px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif"}},c.symbol):null,
+          span({style:{fontSize:"13px",color:"#aaa"}},c.name)
+        ))
+      )
+    ));
+  }
+
+  // Readings
+  sections.push(div({style:{width:"100%",background:"#14141f",borderRadius:"16px",padding:"16px",display:"flex",flexDirection:"column",gap:"12px"}},
+    div({className:"row"},span({className:"label"},"音読み On'yomi"),span({style:{color:"#9775fa",fontSize:"14px",maxWidth:"60%",textAlign:"right"}},item.onyomi||"—")),
+    div({className:"row"},span({className:"label"},"訓読み Kun'yomi"),span({style:{color:"#f59f00",fontSize:"14px",maxWidth:"60%",textAlign:"right"}},item.kunyomi||"—")),
+    div({className:"row"},span({className:"label"},"Quizzed on"),span({style:{color:"#ddd",fontSize:"13px",maxWidth:"60%",textAlign:"right"}},[item.quizMeaning&&"Meaning",item.quizOn&&item.onyomi&&"On'yomi",item.quizKun&&item.kunyomi&&"Kun'yomi"].filter(Boolean).join(", ")||"Meaning only"))
+  ));
+
+  // Mnemonic
+  if(item.mnemonic){
+    sections.push(div({style:{width:"100%",background:"#0e1a0e",border:"1px solid #1a3a1a",borderRadius:"16px",padding:"14px"}},
+      div({style:{fontSize:"11px",color:"#4a7a4a",textTransform:"uppercase",letterSpacing:"1px",marginBottom:"6px"}},"💡 Mnemonic"),
+      div({style:{fontSize:"13px",color:"#aaa",lineHeight:"1.6"}},item.mnemonic)
+    ));
+  }
+
+  // Examples
+  const exCards=[];
+  if(item.ex1)exCards.push(div({style:{background:"#1e1e2e",borderRadius:"10px",padding:"10px 12px"}},
+    span({style:{fontSize:"18px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif"}},item.ex1.word),
+    span({style:{fontSize:"13px",color:"#888",marginLeft:"8px"}},item.ex1.romaji),
+    div({style:{fontSize:"13px",color:"#aaa",marginTop:"3px"}},item.ex1.meaning)
+  ));
+  if(item.ex2)exCards.push(div({style:{background:"#1e1e2e",borderRadius:"10px",padding:"10px 12px"}},
+    span({style:{fontSize:"18px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif"}},item.ex2.word),
+    span({style:{fontSize:"13px",color:"#888",marginLeft:"8px"}},item.ex2.romaji),
+    div({style:{fontSize:"13px",color:"#aaa",marginTop:"3px"}},item.ex2.meaning)
+  ));
+  if(exCards.length){
+    sections.push(div({style:{width:"100%",background:"#14141f",borderRadius:"16px",padding:"14px"}},
+      div({style:{fontSize:"11px",color:"#555",textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}},"Examples"),
+      div({style:{display:"flex",flexDirection:"column",gap:"10px"}},...exCards)
+    ));
+  }
+
+  // Nav buttons
+  const navBtns=div({style:{display:"flex",gap:"12px",width:"100%"}});
+  if(S.lessonIndex>0)navBtns.appendChild(btn({style:{flex:"1",padding:"14px 0",background:"#1e1e2e",border:"1px solid #333",borderRadius:"12px",color:"#aaa",fontSize:"16px",cursor:"pointer"},onClick:()=>{S.lessonIndex--;render();}},"← Prev"));
+  if(S.lessonIndex<S.lessonQueue.length-1){
+    navBtns.appendChild(btn({className:"primary-btn",onClick:()=>{S.lessonIndex++;render();}},"Next →"));
+  } else {
+    navBtns.appendChild(btn({className:"primary-btn",onClick:()=>{S.lessonQueue.forEach(k=>markLearned(k.kanji));S.lessonStep="done";render();}},"Start Quiz →"));
+  }
+
+  const body=div({style:{flex:"1",padding:"24px 20px",display:"flex",flexDirection:"column",alignItems:"center",gap:"14px",overflowY:"auto"}},
+    kanjiTile,
+    div({style:{fontSize:"22px",fontWeight:"600",textAlign:"center"}},item.meaning),
+    ...sections, navBtns
+  );
+
+  return div({style:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"}},header,body);
+}
+
+function buildReview(){
+  if(!S.currentCard){
+    return div({style:{minHeight:"100vh",background:"#0f0f17",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"12px"}},
+      div({style:{fontSize:"48px",marginBottom:"12px"}},"✅"),
+      div({style:{fontSize:"22px",marginBottom:"8px"}},"Reviews Done!"),
+      div({style:{color:"#888",marginBottom:"24px"}},"Great work today"),
+      btn({style:{padding:"14px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"16px",fontWeight:"600",cursor:"pointer"},onClick:()=>go("home")},"Back to Dashboard")
+    );
+  }
+
+  const si=S.srs[S.currentCard.kanji]||{stage:0};
+  const bg=S.feedback==="correct"?"#2b8a3e":S.feedback==="incorrect"?"#c92a2a":"#1a1a2e";
+  const prompts={meaning:"What is the meaning?",onyomi:"What is the on'yomi reading?",kunyomi:"What is the kun'yomi reading?"};
+  const qLabel={meaning:"Meaning",onyomi:"Reading (音)",kunyomi:"Reading (訓)"};
+
+  const header=div({style:{display:"flex",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,0.07)"}},
+    btn({style:{background:"none",border:"none",color:"#888",fontSize:"18px",cursor:"pointer",marginRight:"12px"},onClick:()=>{S.reviewQueue=[];go("home");}},"✕"),
+    span({style:{fontWeight:"600",fontSize:"16px",flex:"1"}},"Reviews"),
+    span({style:{color:"rgba(255,255,255,0.5)",fontSize:"14px"}},S.reviewQueue.length+" left"+(S.streak>1?" 🔥"+S.streak:""))
+  );
+
+  const body=div({style:{flex:"1",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px 20px",gap:"16px"}});
+  body.appendChild(div({style:{background:"rgba(255,255,255,0.1)",borderRadius:"20px",padding:"4px 14px",fontSize:"12px",color:"#ddd",letterSpacing:".5px"}},qLabel[S.quizType]));
+  body.appendChild(div({style:{fontSize:"96px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",lineHeight:"1.1",textShadow:"0 4px 24px rgba(0,0,0,0.3)"}},S.currentCard.kanji));
+  body.appendChild(div({style:{color:"rgba(255,255,255,0.7)",fontSize:"16px"}},prompts[S.quizType]));
+
+  if(!S.feedback){
+    const row=div({style:{display:"flex",gap:"8px",width:"100%",maxWidth:"380px"}});
+    const input=inp({style:{flex:"1",padding:"14px 16px",background:"rgba(255,255,255,0.1)",border:"2px solid rgba(255,255,255,0.2)",borderRadius:"12px",color:"#fff",fontSize:"18px",outline:"none"},type:"text",value:S.input,placeholder:S.quizType==="meaning"?"Type meaning...":"Type reading (romaji/kana)..."});
+    input.addEventListener("input",e=>{S.input=e.target.value;});
+    input.addEventListener("keydown",e=>{if(e.key==="Enter")submitAnswer();});
+    row.appendChild(input);
+    row.appendChild(btn({style:{padding:"14px 20px",background:"rgba(255,255,255,0.15)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"20px",cursor:"pointer"},onClick:submitAnswer},"→"));
+    body.appendChild(row);
+    setTimeout(()=>input.focus(),50);
+  } else {
+    body.appendChild(div({style:{fontSize:"22px",fontWeight:"700"}},S.feedback==="correct"?"✓ Correct!":"✗ Incorrect"));
+    body.appendChild(div({style:{fontSize:"28px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif"}},getAnswer(S.currentCard,S.quizType)));
+    if(S.feedback==="incorrect")body.appendChild(div({style:{fontSize:"14px",color:"rgba(255,255,255,0.6)"}},"Your answer: "+S.input));
+    body.appendChild(div({style:{background:"rgba(255,255,255,0.1)",borderRadius:"20px",padding:"4px 14px",fontSize:"13px"}},ICONS[si.stage]+" "+STAGES[si.stage]));
+
+    const infoBtn=btn({style:{width:"100%",maxWidth:"380px",padding:"14px 0",background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.2)",borderRadius:"12px",color:"#fff",fontSize:"15px",cursor:"pointer"},onClick:()=>{S.showInfo=!S.showInfo;render();}},S.showInfo?"Hide Info":"Show Info");
+    body.appendChild(infoBtn);
+
+    if(S.showInfo){
+      const panel=div({style:{background:"rgba(0,0,0,0.35)",borderRadius:"12px",padding:"16px",width:"100%",maxWidth:"380px",display:"flex",flexDirection:"column",gap:"8px"}});
+      [["Meaning",S.currentCard.meaning],["On'yomi",S.currentCard.onyomi||"—"],["Kun'yomi",S.currentCard.kunyomi||"—"],["Example",[S.currentCard.ex1,S.currentCard.ex2].filter(Boolean).map(e=>e.word+" ("+e.romaji+") - "+e.meaning).join(" | ")||"—"]].forEach(([l,v])=>{
+        panel.appendChild(div({style:{fontSize:"14px",color:"#ddd"}},el("b",{},l+": "),v));
+      });
+      if(S.currentCard.mnemonic)panel.appendChild(div({style:{fontSize:"13px",color:"#8a8",marginTop:"4px",lineHeight:"1.5"}},"💡 "+S.currentCard.mnemonic));
+      body.appendChild(panel);
+    }
+    body.appendChild(btn({style:{width:"100%",maxWidth:"380px",padding:"14px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"16px",fontWeight:"600",cursor:"pointer",marginTop:"4px"},onClick:nextCard},"Next →"));
+  }
+
+  return div({style:{minHeight:"100vh",background:bg,transition:"background 0.3s",color:"#fff",display:"flex",flexDirection:"column"}},header,body);
+}
+
+function buildStats(){
+  const totalLearned=Object.values(S.srs).filter(s=>s.learned).length;
+  const totalBurned=Object.values(S.srs).filter(s=>s.stage===8).length;
+  const tot=Object.values(S.srs).reduce((a,s)=>a+s.correct+s.incorrect,0);
+  const cor=Object.values(S.srs).reduce((a,s)=>a+s.correct,0);
+  const acc=tot>0?Math.round(cor/tot*100):0;
+  const byStage=STAGES.map((_,i)=>Object.values(S.srs).filter(s=>s.stage===i&&s.learned).length);
+
+  const header=div({className:"header"},
+    btn({className:"back-btn",onClick:()=>go("home")},"←"),
+    span({style:{fontWeight:"600",fontSize:"16px"}},"Progress")
+  );
+  const scroll=div({style:{flex:"1",overflowY:"auto",padding:"16px 20px"}});
+
+  const statRow=div({style:{display:"flex",gap:"12px",marginBottom:"24px"}});
+  [[totalLearned,"Learned"],[acc+"%","Accuracy"],[totalBurned,"Burned"]].forEach(([n,l])=>{
+    statRow.appendChild(div({style:{flex:"1",background:"#14141f",borderRadius:"16px",padding:"16px 12px",textAlign:"center"}},
+      div({style:{fontSize:"28px",fontWeight:"700"}},""+n),
+      div({style:{fontSize:"12px",color:"#666",marginTop:"4px"}},l)
+    ));
+  });
+  scroll.appendChild(statRow);
+  scroll.appendChild(div({style:{padding:"4px 0 12px",fontSize:"12px",color:"#555",textTransform:"uppercase",letterSpacing:"1px"}},"SRS Breakdown"));
+  STAGES.forEach((stage,i)=>{
+    const row=div({style:{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px"}});
+    row.appendChild(div({style:{width:"90px",color:"#ccc",fontSize:"13px"}},ICONS[i]+" "+stage));
+    const track=div({style:{flex:"1",height:"8px",background:"#1e1e2e",borderRadius:"4px",overflow:"hidden"}});
+    const fill=div({style:{height:"100%",borderRadius:"4px",transition:"width .5s",width:(byStage[i]/S.kanji.length*100)+"%",background:COLORS[i],minWidth:byStage[i]>0?"4px":"0"}});
+    track.appendChild(fill);row.appendChild(track);
+    row.appendChild(div({style:{width:"28px",color:"#aaa",fontSize:"13px",textAlign:"right"}},""+byStage[i]));
+    scroll.appendChild(row);
+  });
+
+  scroll.appendChild(div({style:{padding:"12px 0 12px",fontSize:"12px",color:"#555",textTransform:"uppercase",letterSpacing:"1px"}},"All Kanji"));
+  const grid=div({style:{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:"8px"}});
+  S.kanji.forEach(k=>{
+    const s=S.srs[k.kanji];
+    grid.appendChild(div({style:{aspectRatio:"1",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:"10px",fontSize:"22px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",background:s?.learned?COLORS[s.stage]:"#222",opacity:s?.learned?"1":".4"},title:k.meaning+" — "+STAGES[s?.stage||0]},k.kanji));
+  });
+  scroll.appendChild(grid);
+  return div({style:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"}},header,scroll);
+}
+
+function buildAdmin(){
+  const header=div({className:"header"},
+    btn({className:"back-btn",onClick:()=>go("home")},"←"),
+    span({style:{fontWeight:"600",fontSize:"16px",flex:"1"}},"Admin — Kanji Data"),
+    S.savedKanji?span({style:{color:"#0ca678",fontSize:"13px"}},"✓ Saved "+S.savedKanji):null
+  );
+  const note=div({style:{padding:"8px 16px",background:"#0a0a14",borderBottom:"1px solid #1a1a2e",fontSize:"11px",color:"#555"}},"📊 Live from Google Sheets · Admin edits saved locally");
+  const searchInp=inp({style:{width:"100%",padding:"11px 14px",background:"#14141f",border:"1.5px solid #2a2a3e",borderRadius:"10px",color:"#fff",fontSize:"14px",outline:"none",boxSizing:"border-box"},type:"text",value:S.adminSearch,placeholder:"🔍  Search kanji, meaning, reading..."});
+  searchInp.addEventListener("input",e=>{S.adminSearch=e.target.value;render();});
+
+  const filtered=S.kanji.filter(k=>k.kanji.includes(S.adminSearch)||
+    (k.meaning||"").toLowerCase().includes(S.adminSearch.toLowerCase())||
+    (k.onyomi||"").includes(S.adminSearch)||(k.kunyomi||"").includes(S.adminSearch));
+
+  const list=div({style:{flex:"1",overflowY:"auto",padding:"0 16px 24px"}});
+  filtered.forEach(k=>{
+    const s=S.srs[k.kanji];
+    const types=[k.quizMeaning&&"Meaning",k.quizOn&&k.onyomi&&"On",k.quizKun&&k.kunyomi&&"Kun"].filter(Boolean);
+    const row=div({style:{display:"flex",alignItems:"center",gap:"12px",padding:"12px 14px",background:"#14141f",borderRadius:"12px",marginBottom:"8px",cursor:"pointer"},onClick:()=>{S.editingKanji={...k};S.screen="editKanji";render();}});
+    row.appendChild(div({style:{fontSize:"30px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",width:"38px",textAlign:"center",color:s?.learned?COLORS[s.stage]:"#444"}},k.kanji));
+    const meta=div({style:{flex:"1"}});
+    meta.appendChild(div({style:{fontSize:"14px",color:"#ddd",marginBottom:"3px"}},(k.meaning||"").split(",")[0]));
+    const tags=div({style:{display:"flex",gap:"6px",flexWrap:"wrap"}});
+    if(k.onyomi)tags.appendChild(span({style:{background:"#1a0a2e",color:"#9775fa",fontSize:"12px",padding:"2px 8px",borderRadius:"10px"}},k.onyomi.split("、")[0]));
+    if(k.kunyomi)tags.appendChild(span({style:{background:"#2a2000",color:"#f59f00",fontSize:"12px",padding:"2px 8px",borderRadius:"10px"}},k.kunyomi.split("、")[0]));
+    if(k.level)tags.appendChild(span({style:{background:"#0a1a0a",color:"#666",fontSize:"11px",padding:"2px 8px",borderRadius:"10px"}},k.level));
+    meta.appendChild(tags);row.appendChild(meta);
+    const badges=div({style:{display:"flex",gap:"4px",flexDirection:"column",alignItems:"flex-end"}});
+    ["Meaning","On","Kun"].forEach(t=>badges.appendChild(span({style:{fontSize:"10px",padding:"2px 7px",borderRadius:"8px",background:"#222",color:"#888",opacity:types.includes(t)?"1":".2"}},t)));
+    row.appendChild(badges);
+    row.appendChild(div({style:{fontSize:"16px",opacity:".4"}},"✏️"));
+    list.appendChild(row);
+  });
+
+  return div({style:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"}},
+    header, note, div({style:{padding:"12px 16px"}},searchInp), list
+  );
+}
+
+function buildEditor(){
+  const k=S.editingKanji;
+  if(!k)return buildAdmin();
+  const header=div({className:"header"},
+    btn({className:"back-btn",onClick:()=>{S.screen="admin";render();}},"←"),
+    span({style:{fontWeight:"600",fontSize:"16px",flex:"1"}},"Edit: "+k.kanji)
+  );
+
+  const body=div({style:{flex:"1",overflowY:"auto",padding:"20px"}});
+  body.appendChild(div({style:{fontSize:"56px",fontFamily:"'Noto Serif JP','Hiragino Mincho Pro','Yu Mincho',serif",textAlign:"center",color:"#f03e3e",marginBottom:"20px"}},k.kanji));
+
+  const fields=[["Meaning","meaning","meeting, society","Comma-separated. First entry is primary."],
+    ["On'yomi 音読み","onyomi","カイ、エ","Separate multiple readings with 、"],
+    ["Kun'yomi 訓読み","kunyomi","あ.う","Use . for okurigana boundary. Leave blank if none."],
+    ["Example","example","会社 (かいしゃ) - company",""],
+    ["Mnemonic","mnemonic","Memory story...",""]];
+
+  fields.forEach(([label,field,ph,hint])=>{
+    const fg=div({style:{marginBottom:"18px"}});
+    fg.appendChild(el("label",{style:{display:"block",fontSize:"12px",color:"#666",textTransform:"uppercase",letterSpacing:".8px",marginBottom:"6px"}},label));
+    const i=inp({style:{width:"100%",padding:"11px 14px",background:"#0f0f1a",border:"1.5px solid #2a2a3e",borderRadius:"10px",color:"#fff",fontSize:"15px",outline:"none",boxSizing:"border-box"},type:"text",value:k[field]||"",placeholder:ph});
+    i.addEventListener("input",e=>{S.editingKanji[field]=e.target.value;});
+    fg.appendChild(i);
+    if(hint)fg.appendChild(div({style:{fontSize:"11px",color:"#444",marginTop:"4px"}},hint));
+    body.appendChild(fg);
+  });
+
+  // Quiz toggles
+  const tg=div({style:{marginBottom:"18px"}});
+  tg.appendChild(el("label",{style:{display:"block",fontSize:"12px",color:"#666",textTransform:"uppercase",letterSpacing:".8px",marginBottom:"8px"}},"Quiz types enabled"));
+  const toggleRow=div({style:{display:"flex",gap:"8px",flexWrap:"wrap"}});
+  [["quizMeaning","📖 Meaning","#0ca678"],["quizOn","音 On'yomi","#6741d9"],["quizKun","訓 Kun'yomi","#f59f00"]].forEach(([field,label,color])=>{
+    const active=k[field];
+    const b=btn({style:{padding:"6px 14px",borderRadius:"20px",border:"1.5px solid "+(active?color:"#333"),background:active?color+"22":"transparent",color:active?color:"#555",fontSize:"13px",cursor:"pointer"},onClick:()=>{S.editingKanji[field]=!S.editingKanji[field];render();}},label);
+    toggleRow.appendChild(b);
+  });
+  tg.appendChild(toggleRow);
+  tg.appendChild(div({style:{fontSize:"11px",color:"#444",marginTop:"6px"}},"Disabled types won't appear in reviews."));
+  body.appendChild(tg);
+
+  const btnRow=div({style:{display:"flex",gap:"10px",marginTop:"8px"}});
+  btnRow.appendChild(btn({style:{flex:"1",padding:"13px 0",background:"#1e1e2e",border:"1px solid #333",borderRadius:"12px",color:"#aaa",fontSize:"15px",cursor:"pointer"},onClick:()=>{S.screen="admin";render();}},"Cancel"));
+  btnRow.appendChild(btn({style:{flex:"1",padding:"13px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"600",cursor:"pointer"},onClick:()=>{
+    S.kanji=S.kanji.map(k2=>k2.kanji===S.editingKanji.kanji?{...S.editingKanji}:k2);
+    S.overrides[S.editingKanji.kanji]={...S.editingKanji};
+    saveOverrides();
+    S.savedKanji=S.editingKanji.kanji;
+    S.screen="admin"; render();
+    setTimeout(()=>{S.savedKanji=null;render();},2000);
+  }},"Save Changes"));
+  body.appendChild(btnRow);
+
+  return div({style:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"}},header,body);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+loadSheet();
+</script>
+</body>
+</html>
