@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>N4 Kanji Study</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=Noto+Serif+JP:wght@400;700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0f0f17; font-family: 'Noto Sans JP', 'Hiragino Sans', sans-serif; color: #fff; }
+    #root { max-width: 480px; margin: 0 auto; min-height: 100vh; }
+    input, button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #0f0f17; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+// ── Your Google Sheet ID — change this if you ever move the sheet ─────────
+const SHEET_ID = "1YIOYntPLK4klwkaiXW9LfVZTXIJNYDS-POOXARI7xqk";
+const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
+
+// ── Column indexes (0-based) matching your sheet A→Y ─────────────────────
+// A=0  Kanji char
+// B=1  Meaning
+// C=2  Kunyomi
+// D=3  Onyomi
+// E=4  Components
+// F=5  Component count
+// G=6  Component 1 Name
+// H=7  Component 1 Symbol
+// I=8  Component 2 Show
+// J=9  Component 2 Name
+// K=10 Component 2 Symbol
+// L=11 Component 3 Show
+// M=12 Component 3 Name
+// N=13 Component 3 Symbol
+// O=14 Component 4 Show
+// P=15 Component 4 Name
+// Q=16 Component 4 Symbol
+// R=17 Mnemonic Story
+// S=18 Ex1 Kunyomi Word
+// T=19 Ex1 Romaji
+// U=20 Ex1 Meaning
+// V=21 Ex2 Onyomi Word
+// W=22 Ex2 Romaji
+// X=23 Ex2 Meaning
+// Y=24 Level
+
+function parseCSV(text) {
+  // Handles quoted fields with commas/newlines inside
+  const rows = [];
+  let row = [], field = "", inQuote = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (inQuote && text[i+1] === '"') { field += '"'; i++; }
+      else inQuote = !inQuote;
+    } else if (ch === ',' && !inQuote) {
+      row.push(field); field = "";
+    } else if ((ch === '\n' || ch === '\r') && !inQuote) {
+      if (ch === '\r' && text[i+1] === '\n') i++;
+      row.push(field); field = "";
+      rows.push(row); row = [];
+    } else {
+      field += ch;
+    }
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function csvRowToKanji(row) {
+  const get = (i) => (row[i] || "").trim();
+  // Auto-detect: kanji char is a single CJK character (or a few)
+  // Some sheets have the columns in a different order than the header suggests
+  const isCJK = (s) => /^[\u3000-\u9FFF\uF900-\uFAFF\u3400-\u4DBF]{1,4}$/.test(s.trim());
+  const colA = get(0), colB = get(1);
+  // If col A looks like English and col B looks like a kanji char, swap them
+  const kanji   = isCJK(colA) ? colA : isCJK(colB) ? colB : colA;
+  const meaning = isCJK(colA) ? colB : isCJK(colB) ? colA : colB;
+  if (!kanji || kanji === "Kanji char") return null; // skip header/empty
+
+  // Normalize readings: bullets (•) → 、, strip non-kana garbage like "Yes"/"No"
+  const cleanReading = (s) => {
+    const normalized = s.replace(/\s*[•·]\s*/g, "、").trim();
+    // If it contains only ASCII letters/words (like "Yes"), it's not a real reading
+    if (/^[a-zA-Z\s]+$/.test(normalized)) return "";
+    return normalized;
+  };
+
+  const kunyomi = cleanReading(get(2));
+  const onyomi  = cleanReading(get(3));
+
+  // Build example strings from the two example columns
+  const ex1 = [get(18), get(19), get(20)].filter(Boolean);
+  const ex2 = [get(21), get(22), get(23)].filter(Boolean);
+  const example1 = ex1.length === 3 ? `${ex1[0]} (${ex1[1]}) - ${ex1[2]}` : "";
+  const example2 = ex2.length === 3 ? `${ex2[0]} (${ex2[1]}) - ${ex2[2]}` : "";
+  const example = [example1, example2].filter(Boolean).join(" | ");
+
+  return {
+    kanji,
+    meaning,
+    kunyomi,
+    onyomi,
+    mnemonic: get(17),
+    example:  example || "—",
+    level:    get(24),
+    // Quiz toggles — on by default, off if reading is empty
+    quizMeaning: true,
+    quizOn:  !!onyomi,
+    quizKun: !!kunyomi,
+  };
+}
+
+// ── SRS constants ─────────────────────────────────────────────────────────
+const STAGES = ["Apprentice 1","Apprentice 2","Apprentice 3","Apprentice 4","Guru 1","Guru 2","Master","Enlightened","Burned"];
+const STAGE_COLORS = ["#f03e3e","#f03e3e","#f03e3e","#f03e3e","#6741d9","#6741d9","#1864ab","#0ca678","#495057"];
+const STAGE_ICONS = ["🌱","🌱","🌱","🌱","🔮","🔮","⚡","✨","🔥"];
+const DELAYS_MS = [4,8,24,48,168,336,720,2880,Infinity].map(h => h * 3600000);
+const LS_SRS = "n4kanji_srs";
+const LS_OVERRIDES = "n4kanji_overrides"; // stores per-kanji admin edits keyed by kanji char
+
+// ── Romaji / Kana helpers ─────────────────────────────────────────────────
+const ROMAJI_TO_HIRA = [
+  ["shi","し"],["chi","ち"],["tsu","つ"],["sha","しゃ"],["shu","しゅ"],["sho","しょ"],
+  ["cha","ちゃ"],["chu","ちゅ"],["cho","ちょ"],["tya","ちゃ"],["tyu","ちゅ"],["tyo","ちょ"],
+  ["nya","にゃ"],["nyu","にゅ"],["nyo","にょ"],["hya","ひゃ"],["hyu","ひゅ"],["hyo","ひょ"],
+  ["mya","みゃ"],["myu","みゅ"],["myo","みょ"],["rya","りゃ"],["ryu","りゅ"],["ryo","りょ"],
+  ["gya","ぎゃ"],["gyu","ぎゅ"],["gyo","ぎょ"],["bya","びゃ"],["byu","びゅ"],["byo","びょ"],
+  ["pya","ぴゃ"],["pyu","ぴゅ"],["pyo","ぴょ"],["kya","きゃ"],["kyu","きゅ"],["kyo","きょ"],
+  ["ja","じゃ"],["ji","じ"],["ju","じゅ"],["jo","じょ"],
+  ["za","ざ"],["zi","じ"],["zu","ず"],["ze","ぜ"],["zo","ぞ"],
+  ["da","だ"],["di","ぢ"],["du","づ"],["de","で"],["do","ど"],
+  ["ba","ば"],["bi","び"],["bu","ぶ"],["be","べ"],["bo","ぼ"],
+  ["pa","ぱ"],["pi","ぴ"],["pu","ぷ"],["pe","ぺ"],["po","ぽ"],
+  ["ka","か"],["ki","き"],["ku","く"],["ke","け"],["ko","こ"],
+  ["sa","さ"],["su","す"],["se","せ"],["so","そ"],
+  ["ta","た"],["te","て"],["to","と"],
+  ["na","な"],["ni","に"],["nu","ぬ"],["ne","ね"],["no","の"],
+  ["ha","は"],["hi","ひ"],["fu","ふ"],["he","へ"],["ho","ほ"],
+  ["ma","ま"],["mi","み"],["mu","む"],["me","め"],["mo","も"],
+  ["ya","や"],["yu","ゆ"],["yo","よ"],
+  ["ra","ら"],["ri","り"],["ru","る"],["re","れ"],["ro","ろ"],
+  ["wa","わ"],["wo","を"],
+  ["ga","が"],["gi","ぎ"],["gu","ぐ"],["ge","げ"],["go","ご"],
+  ["a","あ"],["i","い"],["u","う"],["e","え"],["o","お"],["n","ん"],
+];
+const toHiragana = s => s.split("").map(ch => { const c = ch.charCodeAt(0); return (c>=0x30A1&&c<=0x30F6)?String.fromCharCode(c-0x60):ch; }).join("");
+const romajiToHiragana = str => {
+  let res="", s=str.toLowerCase().replace(/([bcdfghjklmnpqrstvwxyz])\1/g,"っ$1");
+  while(s.length>0){let m=false;for(const[r,h]of ROMAJI_TO_HIRA){if(s.startsWith(r)){res+=h;s=s.slice(r.length);m=true;break;}}if(!m){res+=s[0];s=s.slice(1);}}
+  return res;
+};
+const normalizeReading = s => toHiragana(romajiToHiragana(s.trim().toLowerCase()));
+const getAcceptable = str => str.split(/[、,]/).map(r=>r.trim()).filter(Boolean).flatMap(r=>{
+  if(r.includes(".")){const[a,b]=r.split(".");return[a+b,a];}return[r];
+});
+
+// ── KanjiEditor modal ─────────────────────────────────────────────────────
+function KanjiEditor({ entry, onSave, onClose }) {
+  const [draft, setDraft] = useState({...entry});
+  const set = (f,v) => setDraft(d=>({...d,[f]:v}));
+  const Toggle = ({field,label,color}) => (
+    <button onClick={()=>set(field,!draft[field])} style={{padding:"6px 14px",borderRadius:20,border:`1.5px solid ${draft[field]?color:"#333"}`,background:draft[field]?color+"22":"transparent",color:draft[field]?color:"#555",fontSize:13,cursor:"pointer",transition:"all .15s"}}>
+      {label}
+    </button>
+  );
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:100,backdropFilter:"blur(4px)"}} onClick={onClose}>
+      <div style={{background:"#13131e",borderRadius:"20px 20px 0 0",padding:"24px 20px 40px",width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",border:"1px solid #2a2a3e"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:24}}>
+          <span style={{fontSize:48,fontFamily:"'Noto Serif JP',serif",color:"#f03e3e",lineHeight:1}}>{entry.kanji}</span>
+          <span style={{flex:1,fontSize:18,fontWeight:700}}>Edit Kanji</span>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#666",fontSize:20,cursor:"pointer"}}>✕</button>
+        </div>
+        {[
+          ["Meaning","meaning","meeting, society","Comma-separated. First entry is primary."],
+          ["On'yomi 音読み","onyomi","カイ、エ","Separate multiple readings with 、"],
+          ["Kun'yomi 訓読み","kunyomi","あ.う","Use . for okurigana. Leave blank if none."],
+          ["Example","example","会社 (かいしゃ) - company",""],
+          ["Mnemonic","mnemonic","Memory story...",""],
+        ].map(([label,field,ph,hint])=>(
+          <div key={field} style={{marginBottom:18}}>
+            <label style={{display:"block",fontSize:12,color:"#666",textTransform:"uppercase",letterSpacing:.8,marginBottom:6}}>{label}</label>
+            <input value={draft[field]||""} onChange={e=>set(field,e.target.value)} placeholder={ph}
+              style={{width:"100%",padding:"11px 14px",background:"#0f0f1a",border:"1.5px solid #2a2a3e",borderRadius:10,color:"#fff",fontSize:15,outline:"none",boxSizing:"border-box",fontFamily:"'Noto Sans JP',sans-serif"}}/>
+            {hint&&<div style={{fontSize:11,color:"#444",marginTop:4}}>{hint}</div>}
+          </div>
+        ))}
+        <div style={{marginBottom:18}}>
+          <label style={{display:"block",fontSize:12,color:"#666",textTransform:"uppercase",letterSpacing:.8,marginBottom:8}}>Quiz types enabled</label>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <Toggle field="quizMeaning" label="📖 Meaning" color="#0ca678"/>
+            <Toggle field="quizOn" label="音 On'yomi" color="#6741d9"/>
+            <Toggle field="quizKun" label="訓 Kun'yomi" color="#f59f00"/>
+          </div>
+          <div style={{fontSize:11,color:"#444",marginTop:6}}>Disabled types won't appear in reviews for this kanji.</div>
+        </div>
+        <div style={{display:"flex",gap:10,marginTop:8}}>
+          <button onClick={onClose} style={{flex:1,padding:"13px 0",background:"#1e1e2e",border:"1px solid #333",borderRadius:12,color:"#aaa",fontSize:15,cursor:"pointer"}}>Cancel</button>
+          <button onClick={()=>onSave(draft)} style={{flex:1,padding:"13px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:15,fontWeight:600,cursor:"pointer"}}>Save Changes</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── AdminScreen ───────────────────────────────────────────────────────────
+function AdminScreen({ kanjiData, srs, onUpdate, onBack }) {
+  const [editing, setEditing] = useState(null);
+  const [search, setSearch] = useState("");
+  const [saved, setSaved] = useState(null);
+  const filtered = kanjiData.filter(k=>
+    k.kanji.includes(search)||k.meaning.toLowerCase().includes(search.toLowerCase())||
+    (k.onyomi||"").includes(search)||(k.kunyomi||"").includes(search)
+  );
+  const handleSave = updated => {
+    onUpdate(kanjiData.map(k=>k.kanji===updated.kanji?updated:k));
+    // persist override so it survives sheet reloads
+    try {
+      const ov = JSON.parse(localStorage.getItem(LS_OVERRIDES)||"{}");
+      ov[updated.kanji] = updated;
+      localStorage.setItem(LS_OVERRIDES, JSON.stringify(ov));
+    } catch(e){}
+    setSaved(updated.kanji); setEditing(null); setTimeout(()=>setSaved(null),2000);
+  };
+  const types = k=>[k.quizMeaning&&"Meaning",k.quizOn&&k.onyomi&&"On",k.quizKun&&k.kunyomi&&"Kun"].filter(Boolean);
+  return (
+    <div style={{minHeight:"100vh",background:"#0f0f17",color:"#fff",fontFamily:"'Noto Sans JP',sans-serif",display:"flex",flexDirection:"column"}}>
+      {editing&&<KanjiEditor entry={editing} onSave={handleSave} onClose={()=>setEditing(null)}/>}
+      <div style={{display:"flex",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#888",fontSize:18,cursor:"pointer",marginRight:12,padding:"4px 8px"}}>←</button>
+        <span style={{fontWeight:600,fontSize:16,flex:1}}>Admin — Kanji Data</span>
+        {saved&&<span style={{color:"#0ca678",fontSize:13}}>✓ Saved {saved}</span>}
+      </div>
+      <div style={{padding:"8px 16px",background:"#0a0a14",borderBottom:"1px solid #1a1a2e"}}>
+        <div style={{fontSize:11,color:"#555"}}>📊 Data pulled live from Google Sheets · Admin edits override sheet data and are saved locally</div>
+      </div>
+      <div style={{padding:"12px 16px"}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍  Search kanji, meaning, reading..."
+          style={{width:"100%",padding:"11px 14px",background:"#14141f",border:"1.5px solid #2a2a3e",borderRadius:10,color:"#fff",fontSize:14,outline:"none",boxSizing:"border-box"}}/>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"0 16px 24px"}}>
+        {filtered.map(k=>{
+          const s=srs[k.kanji]; const t=types(k);
+          return (
+            <div key={k.kanji} onClick={()=>setEditing(k)}
+              style={{display:"flex",alignItems:"center",gap:12,padding:"12px 14px",background:"#14141f",borderRadius:12,marginBottom:8,cursor:"pointer"}}>
+              <div style={{fontSize:30,fontFamily:"'Noto Serif JP',serif",width:38,textAlign:"center",color:s?.learned?STAGE_COLORS[s.stage]:"#444"}}>{k.kanji}</div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,color:"#ddd",marginBottom:3}}>{(k.meaning||"").split(",")[0]}</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {k.onyomi&&<span style={{background:"#1a0a2e",color:"#9775fa",fontSize:12,padding:"2px 8px",borderRadius:10}}>{k.onyomi.split("、")[0]}</span>}
+                  {k.kunyomi&&<span style={{background:"#2a2000",color:"#f59f00",fontSize:12,padding:"2px 8px",borderRadius:10}}>{k.kunyomi.split("、")[0]}</span>}
+                  {k.level&&<span style={{background:"#0a1a0a",color:"#666",fontSize:11,padding:"2px 8px",borderRadius:10}}>{k.level}</span>}
+                </div>
+              </div>
+              <div style={{display:"flex",gap:4,flexDirection:"column",alignItems:"flex-end"}}>
+                {["Meaning","On","Kun"].map(tp=><span key={tp} style={{fontSize:10,padding:"2px 7px",borderRadius:8,background:"#222",color:"#888",opacity:t.includes(tp)?1:0.2}}>{tp}</span>)}
+              </div>
+              <div style={{fontSize:16,opacity:0.4}}>✏️</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Loading screen ────────────────────────────────────────────────────────
+function LoadingScreen({ status }) {
+  return (
+    <div style={{minHeight:"100vh",background:"#0f0f17",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,fontFamily:"'Noto Sans JP',sans-serif"}}>
+      <div style={{fontSize:56,fontFamily:"'Noto Serif JP',serif",color:"#f03e3e",animation:"pulse 1.5s ease-in-out infinite"}}>漢</div>
+      <div style={{color:"#666",fontSize:14}}>{status}</div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}`}</style>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+function App() {
+  const [kanjiData, setKanjiData] = useState([]);
+  const [srs, setSrs] = useState({});
+  const [loadStatus, setLoadStatus] = useState("Loading kanji from Google Sheets...");
+  const [loadError, setLoadError] = useState(null);
+  const [screen, setScreen] = useState("home");
+  const [reviewQueue, setReviewQueue] = useState([]);
+  const [lessonQueue, setLessonQueue] = useState([]);
+  const [currentCard, setCurrentCard] = useState(null);
+  const [quizType, setQuizType] = useState("meaning");
+  const [input, setInput] = useState("");
+  const [feedback, setFeedback] = useState(null);
+  const [showInfo, setShowInfo] = useState(false);
+  const [lessonStep, setLessonStep] = useState("learn");
+  const [lessonIndex, setLessonIndex] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [timeOffset, setTimeOffset] = useState(0);
+  const [showDev, setShowDev] = useState(false);
+
+  // ── Fetch sheet on mount ──
+  useEffect(() => {
+    async function fetchSheet() {
+      try {
+        setLoadStatus("Connecting to Google Sheets...");
+        const res = await fetch(SHEET_CSV_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        setLoadStatus("Parsing kanji data...");
+        const rows = parseCSV(text);
+        const parsed = rows.map(csvRowToKanji).filter(Boolean);
+        if (parsed.length === 0) throw new Error("No kanji found in sheet — check column headers");
+
+        // Apply any saved admin overrides on top of sheet data
+        let overrides = {};
+        try { overrides = JSON.parse(localStorage.getItem(LS_OVERRIDES)||"{}"); } catch(e){}
+        const final = parsed.map(k => overrides[k.kanji] ? {...k, ...overrides[k.kanji]} : k);
+
+        setKanjiData(final);
+
+        // Load or init SRS
+        let savedSrs = {};
+        try { savedSrs = JSON.parse(localStorage.getItem(LS_SRS)||"{}"); } catch(e){}
+        const srsData = {};
+        final.forEach(k => {
+          srsData[k.kanji] = savedSrs[k.kanji] || { stage:0, nextReview:Date.now(), correct:0, incorrect:0, learned:false };
+        });
+        setSrs(srsData);
+        setLoadStatus("Ready!");
+      } catch(err) {
+        console.error(err);
+        setLoadError(err.message);
+      }
+    }
+    fetchSheet();
+  }, []);
+
+  // Save SRS whenever it changes
+  useEffect(()=>{ if(Object.keys(srs).length>0){ try{localStorage.setItem(LS_SRS,JSON.stringify(srs));}catch(e){} } },[srs]);
+
+  const now = () => Date.now() + timeOffset;
+  const advanceTime = h => setTimeOffset(p=>p+h*3600000);
+  const resetAll = () => {
+    const fresh={};
+    kanjiData.forEach(k=>{fresh[k.kanji]={stage:0,nextReview:Date.now(),correct:0,incorrect:0,learned:false};});
+    setSrs(fresh); setTimeOffset(0); setReviewQueue([]); setLessonQueue([]); setScreen("home");
+  };
+
+  const eligibleTypes = k => {
+    const t=[];
+    if(k.quizMeaning)t.push("meaning");
+    if(k.quizOn&&k.onyomi)t.push("onyomi");
+    if(k.quizKun&&k.kunyomi)t.push("kunyomi");
+    return t.length>0?t:["meaning"];
+  };
+
+  const reviewable = kanjiData.filter(k=>{ const s=srs[k.kanji]; return s&&s.learned&&s.nextReview<=now(); });
+  const lessonItems = kanjiData.filter(k=>!srs[k.kanji]?.learned);
+
+  useEffect(()=>{
+    if(screen==="review"&&reviewQueue.length===0){
+      const q=reviewable.flatMap(k=>eligibleTypes(k).map(t=>({...k,quizType:t}))).sort(()=>Math.random()-.5);
+      setReviewQueue(q); setCurrentCard(q[0]||null); setQuizType(q[0]?.quizType||"meaning");
+    }
+    if(screen==="lessons"&&lessonQueue.length===0){
+      setLessonQueue(lessonItems.slice(0,5)); setLessonIndex(0); setLessonStep("learn");
+    }
+  },[screen]);
+
+  const getAnswer=(k,t)=>{
+    if(t==="meaning")return(k.meaning||"").split(",")[0].trim().toLowerCase();
+    if(t==="onyomi")return(k.onyomi||"").split("、")[0].trim();
+    return((k.kunyomi||k.onyomi)||"").split("、")[0].trim();
+  };
+
+  const submitAnswer=()=>{
+    if(!currentCard||feedback)return;
+    const ua=input.trim().toLowerCase();
+    let ok=false;
+    if(quizType==="meaning"){
+      ok=(currentCard.meaning||"").split(",").map(m=>m.trim().toLowerCase()).some(m=>m===ua)||((currentCard.meaning||"").toLowerCase().includes(ua)&&ua.length>2);
+    } else {
+      const src=quizType==="onyomi"?currentCard.onyomi:(currentCard.kunyomi||currentCard.onyomi)||"";
+      const nu=normalizeReading(ua);
+      ok=getAcceptable(src).some(r=>normalizeReading(r)===nu);
+    }
+    setFeedback(ok?"correct":"incorrect");
+    setSrs(prev=>{
+      const item=prev[currentCard.kanji]||{stage:0,correct:0,incorrect:0};
+      const ns=ok?Math.min(item.stage+1,8):Math.max(item.stage-1,0);
+      return{...prev,[currentCard.kanji]:{...item,stage:ns,nextReview:now()+DELAYS_MS[ns],correct:item.correct+(ok?1:0),incorrect:item.incorrect+(!ok?1:0)}};
+    });
+    if(ok)setStreak(s=>s+1);else setStreak(0);
+  };
+
+  const nextCard=()=>{
+    const rem=reviewQueue.slice(1);
+    if(feedback==="incorrect")rem.push({...currentCard,quizType:eligibleTypes(currentCard)[0]});
+    setReviewQueue(rem); setInput(""); setFeedback(null); setShowInfo(false);
+    if(rem.length>0){setCurrentCard(rem[0]);setQuizType(rem[0].quizType);}
+    else{setScreen("home");setReviewQueue([]);}
+  };
+
+  const markLearned=kanji=>setSrs(p=>({...p,[kanji]:{...p[kanji],learned:true,nextReview:now()+DELAYS_MS[0]}}));
+
+  // ── Loading / error states ──
+  if(loadError)return(
+    <div style={{minHeight:"100vh",background:"#0f0f17",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,padding:24,fontFamily:"'Noto Sans JP',sans-serif",textAlign:"center"}}>
+      <div style={{fontSize:40}}>⚠️</div>
+      <div style={{color:"#f03e3e",fontSize:18,fontWeight:600}}>Couldn't load Google Sheet</div>
+      <div style={{color:"#888",fontSize:13,maxWidth:340,lineHeight:1.6}}>{loadError}</div>
+      <div style={{color:"#555",fontSize:12,maxWidth:340,lineHeight:1.8}}>
+        Make sure your sheet is set to <b style={{color:"#888"}}>"Anyone with the link can view"</b> and that the Sheet ID in the HTML file matches your sheet URL.
+      </div>
+      <button onClick={()=>window.location.reload()} style={{padding:"12px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:15,cursor:"pointer",marginTop:8}}>Try Again</button>
+    </div>
+  );
+
+  if(kanjiData.length===0)return<LoadingScreen status={loadStatus}/>;
+
+  const totalLearned=Object.values(srs).filter(s=>s.learned).length;
+  const totalBurned=Object.values(srs).filter(s=>s.stage===8).length;
+  const accuracy=(()=>{const tot=Object.values(srs).reduce((a,s)=>a+s.correct+s.incorrect,0);const cor=Object.values(srs).reduce((a,s)=>a+s.correct,0);return tot>0?Math.round(cor/tot*100):0;})();
+  const byStage=STAGES.map((_,i)=>Object.values(srs).filter(s=>s.stage===i&&s.learned).length);
+
+  const P={
+    page:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column"},
+    center:{minHeight:"100vh",background:"#0f0f17",color:"#fff",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12},
+  };
+
+  // ── Admin ──
+  if(screen==="admin")return<AdminScreen kanjiData={kanjiData} srs={srs} onUpdate={setKanjiData} onBack={()=>setScreen("home")}/>;
+
+  // ── Lessons ──
+  if(screen==="lessons"){
+    const batch=lessonQueue;
+    if(!batch.length)return<div style={P.center}><p style={{color:"#aaa"}}>No new lessons.</p><button style={{padding:"12px 24px",background:"#1e1e2e",border:"1px solid #333",borderRadius:12,color:"#aaa",fontSize:15,cursor:"pointer"}} onClick={()=>setScreen("home")}>← Back</button></div>;
+    const item=batch[lessonIndex];
+    if(lessonStep==="learn")return(
+      <div style={P.page}>
+        <div style={{display:"flex",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+          <button onClick={()=>setScreen("home")} style={{background:"none",border:"none",color:"#888",fontSize:18,cursor:"pointer",marginRight:12}}>✕</button>
+          <span style={{fontWeight:600,fontSize:16,flex:1}}>Lessons</span>
+          <span style={{color:"#666",fontSize:14}}>{lessonIndex+1} / {batch.length}</span>
+        </div>
+        <div style={{flex:1,padding:"24px 20px",display:"flex",flexDirection:"column",alignItems:"center",gap:16,overflowY:"auto"}}>
+          <div style={{width:140,height:140,borderRadius:24,display:"flex",alignItems:"center",justifyContent:"center",fontSize:72,fontFamily:"'Noto Serif JP',serif",color:"#fff",background:"linear-gradient(135deg,#e03131,#c92a2a)",boxShadow:"0 8px 32px rgba(0,0,0,0.4)",flexShrink:0}}>{item.kanji}</div>
+          <div style={{fontSize:22,fontWeight:600,textAlign:"center"}}>{item.meaning}</div>
+          <div style={{width:"100%",background:"#14141f",borderRadius:16,padding:16,display:"flex",flexDirection:"column",gap:12}}>
+            {[
+              ["音読み", item.onyomi||"—"],
+              ["訓読み", item.kunyomi||"—"],
+              ["Example", item.example||"—"],
+              item.level&&["Level", item.level],
+              ["Quizzed on", [item.quizMeaning&&"Meaning",item.quizOn&&item.onyomi&&"On'yomi",item.quizKun&&item.kunyomi&&"Kun'yomi"].filter(Boolean).join(", ")||"Meaning only"],
+            ].filter(Boolean).map(([l,v])=>(
+              <div key={l} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <span style={{color:"#666",fontSize:13,flexShrink:0}}>{l}</span>
+                <span style={{color:"#ddd",fontSize:14,maxWidth:"65%",textAlign:"right"}}>{v}</span>
+              </div>
+            ))}
+          </div>
+          {item.mnemonic&&(
+            <div style={{width:"100%",background:"#0e1a0e",border:"1px solid #1a3a1a",borderRadius:16,padding:16}}>
+              <div style={{fontSize:11,color:"#4a7a4a",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>💡 Mnemonic</div>
+              <div style={{fontSize:13,color:"#aaa",lineHeight:1.6}}>{item.mnemonic}</div>
+            </div>
+          )}
+          <div style={{display:"flex",gap:12,width:"100%"}}>
+            {lessonIndex>0&&<button onClick={()=>setLessonIndex(i=>i-1)} style={{flex:1,padding:"14px 0",background:"#1e1e2e",border:"1px solid #333",borderRadius:12,color:"#aaa",fontSize:16,cursor:"pointer"}}>← Prev</button>}
+            {lessonIndex<batch.length-1
+              ?<button onClick={()=>setLessonIndex(i=>i+1)} style={{flex:1,padding:"14px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:16,fontWeight:600,cursor:"pointer"}}>Next →</button>
+              :<button onClick={()=>{batch.forEach(k=>markLearned(k.kanji));setLessonStep("done");}} style={{flex:1,padding:"14px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:16,fontWeight:600,cursor:"pointer"}}>Start Quiz →</button>
+            }
+          </div>
+        </div>
+      </div>
+    );
+    return<div style={P.center}><div style={{fontSize:48,marginBottom:12}}>🎉</div><div style={{color:"#fff",fontSize:22,fontFamily:"'Noto Serif JP',serif",marginBottom:8}}>Lesson Complete!</div><div style={{color:"#888",marginBottom:24}}>{batch.length} kanji added to reviews</div><button onClick={()=>{setScreen("home");setLessonQueue([]);}} style={{padding:"14px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:16,fontWeight:600,cursor:"pointer"}}>Back to Dashboard</button></div>;
+  }
+
+  // ── Review ──
+  if(screen==="review"){
+    if(!currentCard)return<div style={P.center}><div style={{fontSize:48,marginBottom:12}}>✅</div><div style={{color:"#fff",fontSize:22,marginBottom:8}}>Reviews Done!</div><div style={{color:"#888",marginBottom:24}}>Great work today</div><button onClick={()=>setScreen("home")} style={{padding:"14px 28px",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:16,fontWeight:600,cursor:"pointer"}}>Back to Dashboard</button></div>;
+    const si=srs[currentCard.kanji]||{stage:0};
+    const bg=feedback==="correct"?"#2b8a3e":feedback==="incorrect"?"#c92a2a":"#1a1a2e";
+    const prompts={meaning:"What is the meaning?",onyomi:"What is the on'yomi reading?",kunyomi:"What is the kun'yomi reading?"};
+    return(
+      <div style={{...P.page,background:bg,transition:"background 0.3s"}}>
+        <div style={{display:"flex",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+          <button onClick={()=>{setScreen("home");setReviewQueue([]);setFeedback(null);}} style={{background:"none",border:"none",color:"#888",fontSize:18,cursor:"pointer",marginRight:12}}>✕</button>
+          <span style={{fontWeight:600,fontSize:16,flex:1}}>Reviews</span>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:14}}>{reviewQueue.length} left {streak>1?`🔥${streak}`:""}</span>
+        </div>
+        <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px 20px",gap:16}}>
+          <div style={{background:"rgba(255,255,255,0.1)",borderRadius:20,padding:"4px 14px",fontSize:12,color:"#ddd",letterSpacing:.5}}>{quizType==="meaning"?"Meaning":quizType==="onyomi"?"Reading (音)":"Reading (訓)"}</div>
+          <div style={{fontSize:96,fontFamily:"'Noto Serif JP',serif",lineHeight:1.1,textShadow:"0 4px 24px rgba(0,0,0,0.3)"}}>{currentCard.kanji}</div>
+          <div style={{color:"rgba(255,255,255,0.7)",fontSize:16}}>{prompts[quizType]}</div>
+          {!feedback?(
+            <div style={{display:"flex",gap:8,width:"100%",maxWidth:380}}>
+              <input autoFocus value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitAnswer()}
+                placeholder={quizType==="meaning"?"Type meaning...":"Type reading (romaji/kana)..."}
+                style={{flex:1,padding:"14px 16px",background:"rgba(255,255,255,0.1)",border:"2px solid rgba(255,255,255,0.2)",borderRadius:12,color:"#fff",fontSize:18,outline:"none"}}/>
+              <button onClick={submitAnswer} style={{padding:"14px 20px",background:"rgba(255,255,255,0.15)",border:"none",borderRadius:12,color:"#fff",fontSize:20,cursor:"pointer"}}>→</button>
+            </div>
+          ):(
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:10,width:"100%",maxWidth:380}}>
+              <div style={{fontSize:22,fontWeight:700}}>{feedback==="correct"?"✓ Correct!":"✗ Incorrect"}</div>
+              <div style={{fontSize:28,fontFamily:"'Noto Serif JP',serif"}}>{getAnswer(currentCard,quizType)}</div>
+              {feedback==="incorrect"&&<div style={{fontSize:14,color:"rgba(255,255,255,0.6)"}}>Your answer: {input}</div>}
+              <div style={{background:"rgba(255,255,255,0.1)",borderRadius:20,padding:"4px 14px",fontSize:13}}>{STAGE_ICONS[si.stage]} {STAGES[si.stage]}</div>
+              <button onClick={()=>setShowInfo(i=>!i)} style={{width:"100%",padding:"14px 0",background:"rgba(255,255,255,0.15)",border:"1px solid rgba(255,255,255,0.2)",borderRadius:12,color:"#fff",fontSize:15,cursor:"pointer"}}>{showInfo?"Hide Info":"Show Info"}</button>
+              {showInfo&&(
+                <div style={{background:"rgba(0,0,0,0.35)",borderRadius:12,padding:16,width:"100%",display:"flex",flexDirection:"column",gap:8}}>
+                  {[["Meaning",currentCard.meaning],["On'yomi",currentCard.onyomi||"—"],["Kun'yomi",currentCard.kunyomi||"—"],["Example",currentCard.example||"—"]].map(([l,v])=>(
+                    <div key={l} style={{fontSize:14,color:"#ddd"}}><b>{l}:</b> {v}</div>
+                  ))}
+                  {currentCard.mnemonic&&<div style={{fontSize:13,color:"#8a8",marginTop:4,lineHeight:1.5}}><b>💡</b> {currentCard.mnemonic}</div>}
+                </div>
+              )}
+              <button onClick={nextCard} style={{width:"100%",padding:"14px 0",background:"linear-gradient(135deg,#6741d9,#9775fa)",border:"none",borderRadius:12,color:"#fff",fontSize:16,fontWeight:600,cursor:"pointer",marginTop:4}}>Next →</button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Stats ──
+  if(screen==="stats")return(
+    <div style={P.page}>
+      <div style={{display:"flex",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+        <button onClick={()=>setScreen("home")} style={{background:"none",border:"none",color:"#888",fontSize:18,cursor:"pointer",marginRight:12}}>←</button>
+        <span style={{fontWeight:600,fontSize:16}}>Progress</span>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"16px 20px"}}>
+        <div style={{display:"flex",gap:12,marginBottom:24}}>
+          {[[totalLearned,"Learned"],[accuracy+"%","Accuracy"],[totalBurned,"Burned"]].map(([n,l])=>(
+            <div key={l} style={{flex:1,background:"#14141f",borderRadius:16,padding:"16px 12px",textAlign:"center"}}>
+              <div style={{fontSize:28,fontWeight:700}}>{n}</div>
+              <div style={{fontSize:12,color:"#666",marginTop:4}}>{l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{padding:"4px 0 12px",fontSize:12,color:"#555",textTransform:"uppercase",letterSpacing:1}}>SRS Breakdown</div>
+        {STAGES.map((stage,i)=>(
+          <div key={stage} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <div style={{width:90,color:"#ccc",fontSize:13}}>{STAGE_ICONS[i]} {stage}</div>
+            <div style={{flex:1,height:8,background:"#1e1e2e",borderRadius:4,overflow:"hidden"}}>
+              <div style={{height:"100%",borderRadius:4,transition:"width .5s",width:`${(byStage[i]/kanjiData.length)*100}%`,background:STAGE_COLORS[i],minWidth:byStage[i]>0?4:0}}/>
+            </div>
+            <div style={{width:28,color:"#aaa",fontSize:13,textAlign:"right"}}>{byStage[i]}</div>
+          </div>
+        ))}
+        <div style={{padding:"12px 0 12px",fontSize:12,color:"#555",textTransform:"uppercase",letterSpacing:1}}>All Kanji</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:8}}>
+          {kanjiData.map(k=>{ const s=srs[k.kanji]; return(
+            <div key={k.kanji} title={`${k.meaning} — ${STAGES[s?.stage||0]}`}
+              style={{aspectRatio:"1",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:10,fontSize:22,fontFamily:"'Noto Serif JP',serif",background:s?.learned?STAGE_COLORS[s.stage]:"#222",opacity:s?.learned?1:0.4}}>
+              {k.kanji}
+            </div>
+          );})}
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── Home ──
+  return(
+    <div style={P.page}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px",borderBottom:"1px solid #1e1e2e"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:28,fontFamily:"'Noto Serif JP',serif",color:"#f03e3e",fontWeight:700}}>漢字</span>
+          <span style={{fontSize:15,color:"#888",letterSpacing:1}}>N4 Study</span>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <button onClick={()=>setScreen("admin")} title="Admin" style={{background:"none",border:"none",fontSize:22,cursor:"pointer"}}>⚙️</button>
+          <button onClick={()=>setScreen("stats")} style={{background:"none",border:"none",fontSize:22,cursor:"pointer"}}>📊</button>
+          <button onClick={()=>setShowDev(d=>!d)} title="QA" style={{background:"none",border:"none",fontSize:16,cursor:"pointer",opacity:.45}}>🛠</button>
+        </div>
+      </div>
+
+      {showDev&&(
+        <div style={{margin:"0 20px 4px",background:"#0a0a14",border:"1px solid #ffd43b44",borderRadius:14,padding:"14px 16px"}}>
+          <div style={{fontSize:12,color:"#ffd43b",fontWeight:700,letterSpacing:1,marginBottom:8,textTransform:"uppercase"}}>🛠 Dev Controls</div>
+          <div style={{fontSize:13,color:"#888",marginBottom:10}}>⏱ Offset: <b style={{color:"#ffd43b"}}>+{Math.round(timeOffset/3600000)}h</b> · {reviewable.length} reviews due · {kanjiData.length} kanji loaded</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {[[4,"4h"],[12,"12h"],[24,"24h"],[168,"7d"]].map(([h,l])=>(
+              <button key={l} onClick={()=>advanceTime(h)} style={{padding:"7px 14px",background:"#1a1a2e",border:"1px solid #333",borderRadius:8,color:"#ccc",fontSize:13,cursor:"pointer"}}>+{l}</button>
+            ))}
+            <button onClick={resetAll} style={{padding:"7px 14px",background:"#2b0000",border:"1px solid #f03e3e",borderRadius:8,color:"#f03e3e",fontSize:13,cursor:"pointer"}}>Reset All</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{padding:"24px 20px 12px",borderBottom:"1px solid #1e1e2e"}}>
+        <div style={{display:"flex",gap:16,fontSize:32,marginBottom:20,fontFamily:"'Noto Serif JP',serif"}}>
+          {kanjiData.slice(0,6).map(k=>(
+            <span key={k.kanji} style={{transition:"color .5s",opacity:srs[k.kanji]?.learned?1:0.2,color:srs[k.kanji]?.learned?STAGE_COLORS[srs[k.kanji].stage]:"#fff"}}>{k.kanji}</span>
+          ))}
+        </div>
+        <div style={{display:"flex",alignItems:"center"}}>
+          {[[`${totalLearned}/${kanjiData.length}`,"Learned"],[reviewable.length,"Reviews"],[lessonItems.length,"Lessons"]].map(([n,l],i)=>(
+            <React.Fragment key={l}>
+              {i>0&&<div style={{width:1,height:40,background:"#222"}}/>}
+              <div style={{flex:1,textAlign:"center"}}>
+                <div style={{fontSize:32,fontWeight:700,color:l==="Reviews"&&reviewable.length>0?"#f03e3e":"#fff"}}>{n}</div>
+                <div style={{fontSize:12,color:"#666",marginTop:2}}>{l}</div>
+              </div>
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:12,padding:"20px"}}>
+        <button onClick={()=>reviewable.length>0&&setScreen("review")} disabled={reviewable.length===0}
+          style={{flex:1,background:"#14141f",border:`2px solid ${reviewable.length>0?"#f03e3e":"#333"}`,borderRadius:16,padding:"20px 16px",cursor:reviewable.length>0?"pointer":"default",textAlign:"center",color:"#fff",opacity:reviewable.length>0?1:.5}}>
+          <div style={{fontSize:28,marginBottom:6}}>📝</div><div style={{fontSize:14,color:"#aaa",marginBottom:4}}>Reviews</div>
+          <div style={{fontSize:20,fontWeight:700,color:"#f03e3e"}}>{reviewable.length}</div>
+        </button>
+        <button onClick={()=>lessonItems.length>0&&setScreen("lessons")} disabled={lessonItems.length===0}
+          style={{flex:1,background:"#14141f",border:`2px solid ${lessonItems.length>0?"#6741d9":"#333"}`,borderRadius:16,padding:"20px 16px",cursor:lessonItems.length>0?"pointer":"default",textAlign:"center",color:"#fff",opacity:lessonItems.length>0?1:.5}}>
+          <div style={{fontSize:28,marginBottom:6}}>📚</div><div style={{fontSize:14,color:"#aaa",marginBottom:4}}>Lessons</div>
+          <div style={{fontSize:20,fontWeight:700,color:"#6741d9"}}>{Math.min(lessonItems.length,5)} new</div>
+        </button>
+      </div>
+
+      <div style={{padding:"4px 20px 12px",fontSize:12,color:"#555",textTransform:"uppercase",letterSpacing:1}}>Quick Review</div>
+      <div style={{padding:"0 20px",display:"flex",flexDirection:"column",gap:8,overflowY:"auto",flex:1,paddingBottom:24}}>
+        {kanjiData.filter(k=>srs[k.kanji]?.learned).slice(0,8).map(k=>{
+          const s=srs[k.kanji];
+          return(
+            <div key={k.kanji} style={{display:"flex",alignItems:"center",gap:14,padding:"10px 14px",background:"#14141f",borderRadius:12}}>
+              <div style={{fontSize:28,fontFamily:"'Noto Serif JP',serif",width:40,textAlign:"center",color:STAGE_COLORS[s.stage]}}>{k.kanji}</div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,color:"#ddd"}}>{(k.meaning||"").split(",")[0]}</div>
+                <div style={{fontSize:12,marginTop:2,color:STAGE_COLORS[s.stage]}}>{STAGE_ICONS[s.stage]} {STAGES[s.stage]}</div>
+              </div>
+            </div>
+          );
+        })}
+        {totalLearned===0&&<div style={{color:"#555",fontSize:14,padding:"12px 0"}}>Start lessons to add kanji here</div>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
